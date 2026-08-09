@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from typing import TYPE_CHECKING, Any
+import os
 import threading
 import time
 import weakref
@@ -52,6 +53,7 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
+from lmcache.v1.multiprocess.modules.aux_store import AuxBlobStore
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
@@ -130,6 +132,12 @@ class _CBRopeState:
             declared map). Legacy registrations (empty ``group_rot``) get
             ``(0, head_size)``.
 
+        Note:
+            This answers only "what window would rotate", independent of
+            whether a cos/sin cache exists — a NoPE model (no caches at all)
+            is a separate axis, checked against ``cos_sin_caches`` by the
+            consumers.
+
         Raises:
             RuntimeError: If ``engine_group_idx`` is outside a non-empty map.
         """
@@ -144,22 +152,26 @@ class _CBRopeState:
             )
         return self.group_rot[engine_group_idx]
 
-    def cache_for_group(self, engine_group_idx: int) -> torch.Tensor:
+    def cache_for_group(self, engine_group_idx: int) -> "torch.Tensor | None":
         """The cos/sin cache for one engine group.
 
         Engine groups partition layers by attention type, and rope follows
         attention type (sliding=local theta, full=global theta),
-        so each engine group has exactly one cache.
+        so each engine group has exactly one cache. NoPE models (e.g.
+        NemotronH, whose attention layers apply no rotary at all) register
+        zero caches; every group then returns ``None`` and re-RoPE is skipped.
 
         Args:
             engine_group_idx: The kernel group's engine group index.
 
         Returns:
-            The group's cos/sin cache tensor.
+            The group's cos/sin cache tensor, or ``None`` for a NoPE model.
 
         Raises:
             RuntimeError: If ``engine_group_idx`` is outside the map.
         """
+        if not self.cos_sin_caches:
+            return None
         if not self.group_to_cache:
             return self.cos_sin_caches[0]
         if engine_group_idx >= len(self.group_to_cache):
@@ -227,6 +239,36 @@ class BlendTokenRangeMatcherV3:
         # V3 addition: compact_chunk_id -> full poly hash, for collision reject.
         self._chunk_poly_hash: list[int] = []
 
+    def _content_is_live(self, poly_hash: int) -> bool:
+        """Is a non-evicted chunk already registered for this exact content?
+
+        The token-hash dedup in ``on_new_token_hashes`` cannot answer this:
+        LMCache chains a token hash over the preceding tokens, so the same
+        chunk content stored behind a different preamble hashes differently
+        every time. A CacheBlend blend writes its result back and does exactly
+        that, so without a content-level check each blend registers another
+        generation of content the matcher already holds *and displaces the
+        previous one in the table* — the incumbent's object then ages out and
+        every later lookup classifies the content stale. Keeping the first
+        generation is also the cheaper choice: it is the one whose objects are
+        already warm.
+
+        Self-healing on eviction — ``remove_chunks`` clears both fields read
+        below, so once the incumbent object goes away the content is
+        registrable again by the next store that carries it.
+
+        Caller must hold ``self._lock``.
+        """
+        cid = int(self._table_id[poly_hash & int(self._mask)])
+        if cid < 0:
+            return False
+        # A shared slot can also mean a poly-hash collision, so compare the
+        # full hash; an evicted entry has its token hash cleared to None.
+        return (
+            self._chunk_token_hash[cid] is not None
+            and self._chunk_poly_hash[cid] == poly_hash
+        )
+
     def on_new_token_hashes(
         self,
         token_ids: list[int],
@@ -262,6 +304,7 @@ class BlendTokenRangeMatcherV3:
                 i
                 for i in range(start_chunk_idx, n)
                 if token_hashes[i] not in self._token_hash_to_compact_id
+                and not self._content_is_live(int(chunk_hashes[i]))
             ]
             if not new_idxs:
                 return
@@ -554,6 +597,12 @@ class BlendV3Module(InstanceLivenessTarget):
         self._event_bus = ctx.event_bus
         self._cb_rope_state: dict[int, _CBRopeState] = {}
 
+        # Opaque per-chunk aux-blob store, keyed by the same fingerprints as
+        # the KV objects: the side plane a recurrent-state hybrid needs to
+        # reuse a chunk (NemotronH mamba2 conv/ssm state, GDN projections).
+        # Fully payload-agnostic; see aux_store.py.
+        self._aux_store = AuxBlobStore(ctx)
+
         # L2 opt: cache TP-expanded obj_keys at lookup, pop at retrieve.
         self._lookup_obj_keys_cache: dict[str, dict[bytes, list]] = {}
         self._lookup_obj_keys_lock = threading.Lock()
@@ -634,6 +683,12 @@ class BlendV3Module(InstanceLivenessTarget):
                 self.cb_retrieve_pre_computed,
                 ThreadPoolType.AFFINITY,
             ),
+            HandlerSpec(RequestType.AUX_PUT, self.store_aux, ThreadPoolType.AFFINITY),
+            HandlerSpec(
+                RequestType.AUX_GET_BY_HASH_IPC,
+                self.retrieve_aux_by_hashes_ipc,
+                ThreadPoolType.AFFINITY,
+            ),
         ]
 
     def report_status(self) -> dict:
@@ -701,10 +756,10 @@ class BlendV3Module(InstanceLivenessTarget):
                 legacy inference and would get its content dims rotated.
 
         Raises:
-            ValueError: If ``instance_id`` has no registered KV cache, the
-                cache list is empty, ``group_to_cache`` references a missing
-                cache or does not cover every engine group of the registered
-                model, or a ``group_rot`` entry is malformed.
+            ValueError: If ``instance_id`` has no registered KV cache,
+                ``group_to_cache`` references a missing cache or does not
+                cover every engine group of the registered model, or a
+                ``group_rot`` entry is malformed.
         """
         entry = self._transfer_module.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -712,8 +767,9 @@ class BlendV3Module(InstanceLivenessTarget):
                 f"Instance {instance_id} has no paged KV cache registered; "
                 "send REGISTER_KV_CACHE before CB_REGISTER_ROPE_V3."
             )
-        if not cos_sin_caches_ipc:
-            raise ValueError("CB_REGISTER_ROPE_V3 requires >=1 cos/sin cache.")
+        # Zero caches is legal: a NoPE model (NemotronH) applies no rotary at
+        # all. The rope state is still registered — it carries the head layout
+        # the scatter geometry needs — and every re-RoPE consumer skips.
         if group_to_cache:
             if min(group_to_cache) < 0 or max(group_to_cache) >= len(
                 cos_sin_caches_ipc
@@ -790,7 +846,7 @@ class BlendV3Module(InstanceLivenessTarget):
             instance_id,
             len(cos_sin_caches),
             [tuple(c.shape) for c in cos_sin_caches],
-            cos_sin_caches[0].dtype,
+            cos_sin_caches[0].dtype if cos_sin_caches else "n/a (NoPE)",
             head_size,
             is_neox_style,
             "uniform" if not group_to_cache else str(group_to_cache),
@@ -1344,9 +1400,13 @@ class BlendV3Module(InstanceLivenessTarget):
                     for c in candidates
                     if c.old_st != c.cur_st or (c.cur_st // chunk_size) not in retained
                 ]
-            job.non_prefix = self._non_overlapping_after_prefix(
-                candidates, prefix_tokens
-            )
+            # Prefix-filter only — the overlap dedup runs AFTER the prefetch
+            # (see the classify site below). Two generations of the same content
+            # match at different offsets and overlap, so deduping here picks a
+            # winner blind to whether its object can actually be fetched; when
+            # that guess is wrong the whole request loses CB even though a
+            # perfectly good alternative was in hand.
+            job.non_prefix = [c for c in candidates if c.cur_st >= prefix_tokens]
             if job.non_prefix:
                 layout_desc = self._resolve_cb_layout_desc(
                     key.model_name, key.world_size
@@ -1402,13 +1462,28 @@ class BlendV3Module(InstanceLivenessTarget):
 
         # --- BOTH legs ready: classify the complement + finalize. ---
         if job.handle is not None:
-            found = self._sparse_classify(
+            fetched = self._sparse_classify(
                 key,
                 job.non_prefix or [],
                 job.found_uidx or set(),
                 job.per_hash_obj_keys or {},
                 job.expanded_uidx or [],
             )
+            # Overlap dedup over the RETRIEVABLE candidates: two matches across
+            # the same request range cannot both scatter, and now the loser is
+            # chosen among chunks we know we can serve. Keys loaded for the
+            # candidates dropped here are released by the retrieve path's orphan
+            # sweep (they stay in the lookup obj-key cache).
+            found = self._non_overlapping_after_prefix(
+                fetched, prefix_chunks * chunk_size
+            )
+            if len(found) != len(fetched):
+                logger.debug(
+                    "CB kept %d of %d retrievable matches after overlap dedup (req=%s)",
+                    len(found),
+                    len(fetched),
+                    rid,
+                )
         else:
             found = []
 
@@ -1516,7 +1591,31 @@ class BlendV3Module(InstanceLivenessTarget):
             if not chunk_hashes:
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
-            start_chunk_idx = 1 if key.start == 0 else 0
+            # Chunk 0 is skipped because the prefix lookup leg owns it: that
+            # leg always matches from position 0, so a content fingerprint for
+            # chunk 0 would be redundant.
+            #
+            # That reasoning fails for recurrent-state hybrids (NemotronH
+            # mamba2), which run CB_DISABLE_PREFIX_LEG=1 — a prefix-class match
+            # hands back KV without the recurrent state it was produced under.
+            # With the leg off, chunk 0 is owned by nobody: never fingerprinted,
+            # so never matchable, so every request recomputes its first chunk.
+            #
+            # Indexing it is nonetheless OPT-IN (CB_INDEX_CHUNK0=1) because it
+            # is a measured net LOSS today. On Ultra TP8 30k it does exactly
+            # what it should to the forward — recompute set 28.9% -> 17.1%,
+            # forward.total 768 -> 588 ms — but the extra match makes the
+            # matcher select a *shifted* alignment family (segments at
+            # 17 + k*4160 instead of k*4160), and the store-side chunk skip
+            # requires a match on the store's chunk grid: it goes from skipping
+            # 6 of 7 chunks to skipping none, store.encode 55 -> 363 ms, a net
+            # +120 ms. The flag exists so the forward-side win is one env var
+            # away once the store skip handles shifted matches.
+            index_chunk0 = (
+                os.environ.get("CB_DISABLE_PREFIX_LEG", "0") != "0"
+                and os.environ.get("CB_INDEX_CHUNK0", "0") != "0"
+            )
+            start_chunk_idx = 0 if (key.start != 0 or index_chunk0) else 1
             job = (tokens_in_range, chunk_hashes, start_chunk_idx, key.start)
             with self._pending_fp_lock:
                 self._pending_fp_hashes.update(chunk_hashes[start_chunk_idx:])
@@ -1536,6 +1635,92 @@ class BlendV3Module(InstanceLivenessTarget):
             )
 
         return result
+
+    def store_aux(
+        self,
+        key: IPCCacheServerKey,
+        group: int,
+        sizes: list[int],
+        blob_ipc: DeviceIPCWrapper,
+    ) -> bool:
+        """AUX_PUT handler: store the caller's per-chunk blobs (see AuxBlobStore).
+
+        Args:
+            key (IPCCacheServerKey): Store key for the range being cached.
+            group (int): Object-group id for this aux stream.
+            sizes (list[int]): Per-chunk blob byte lengths (chunk order).
+            blob_ipc (DeviceIPCWrapper): IPC handle to the concatenated
+                per-chunk blob payload.
+
+        Returns:
+            bool: Result of :meth:`AuxBlobStore.store`.
+        """
+        blob = blob_ipc.to_tensor().reshape(-1).view(torch.uint8)
+        return self._aux_store.store(key, group, sizes, blob)
+
+    def retrieve_aux_by_hashes_ipc(
+        self,
+        key: IPCCacheServerKey,
+        group: int,
+        chunk_hashes: list[bytes],
+        sizes: list[int],
+        dst_ipc: DeviceIPCWrapper,
+        instance_id: int,
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """AUX_GET_BY_HASH_IPC handler: copy matched chunks straight into the
+        worker's IPC-mapped GPU receive buffer (no D2H / ZMQ bytes / H2D),
+        gated by CUDA IPC events. Mirrors :meth:`cb_retrieve_pre_computed`.
+
+        Maps the worker buffer (``dst_ipc.to_tensor``), orders the copies after
+        the worker's forward (waits ``event_ipc_handle`` on the instance's
+        stream), copies each prefetched L1 chunk into ``dst`` on that stream,
+        and records a completion event the worker waits on. The data never
+        leaves the (shared) GPU.
+
+        Args:
+            key (IPCCacheServerKey): Carries model/world_size/worker_id/salt.
+            group (int): Object-group id for this aux stream.
+            chunk_hashes (list[bytes]): Stored per-chunk hashes, one per chunk.
+            sizes (list[int]): Per-chunk blob byte lengths (aligned to hashes).
+            dst_ipc (DeviceIPCWrapper): IPC handle of the worker's GPU receive
+                buffer (>= ``sum(sizes)`` bytes, uint8).
+            instance_id (int): Registered KV-cache instance (for the GPU
+                context's device + stream).
+            event_ipc_handle (bytes): The worker's forward-fence CUDA event.
+
+        Returns:
+            tuple[bytes, bool]: ``(completion_event_ipc_handle, ok)`` — ``ok``
+            is ``False`` on a miss/size-mismatch so the worker recomputes.
+
+        Raises:
+            ValueError: If ``instance_id`` has no registered KV cache.
+        """
+        entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            raise ValueError(
+                f"Instance {instance_id} not registered for paged KV cache"
+            )
+        gpu_context = entry.cache_context
+        obj_keys = ipc_key_to_object_keys(key, list(chunk_hashes), [group])[0]
+        with (
+            torch_dev.device(gpu_context.device),
+            torch_dev.stream(gpu_context.stream),
+        ):
+            check_interprocess_event_support()
+            event = torch_dev.Event(interprocess=True)
+            # Map the worker's receive buffer into this process (same physical
+            # GPU -> zero-copy view), exactly as store_aux maps the PUT blob.
+            dst = dst_ipc.to_tensor().reshape(-1).view(torch.uint8)
+            # Order the copies AFTER the worker's outstanding forward work.
+            if hasattr(torch_dev.Event, "from_ipc_handle"):
+                vllm_event = torch_dev.Event.from_ipc_handle(
+                    gpu_context.device, event_ipc_handle
+                )
+                vllm_event.wait(stream=gpu_context.stream)
+            ok = self._aux_store.fetch_into_ipc(obj_keys, sizes, dst)
+            event.record()
+        return event.ipc_handle(), ok
 
     def _submit_coordinator_match(self, key: IPCCacheServerKey) -> bool:
         """Issue a fleet directory match query for this request (best-effort).
@@ -1690,6 +1875,8 @@ class BlendV3Module(InstanceLivenessTarget):
         """
         if not slots_to_rope:
             return
+        if not rope_state.cos_sin_caches:
+            return  # NoPE model: stored K is position-independent.
         num_groups = gpu_context.kv_layer_groups_manager.num_kernel_groups
         for group_idx in range(num_groups):
             group = gpu_context.kv_layer_groups_manager.kernel_groups[group_idx]
@@ -1712,8 +1899,10 @@ class BlendV3Module(InstanceLivenessTarget):
                 rot,
             )
             # Per-group rope cache: dual-RoPE models rotate each
-            # kernel group with its own theta's cos/sin.
+            # kernel group with its own theta's cos/sin. Non-None here: the
+            # NoPE (zero-cache) case returned at the top of this method.
             group_cos_sin = rope_state.cache_for_group(group.engine_group_idx)
+            assert group_cos_sin is not None
             if rot_offset > 0 and int(group_cos_sin.shape[1]) != rot[1]:
                 raise RuntimeError(
                     f"CB re-RoPE: group {group_idx} declares rope width "
@@ -1907,12 +2096,12 @@ class BlendV3Module(InstanceLivenessTarget):
                 is_neox=rope_state.is_neox_style,
             )
             rot = rope_state.rot_for_group(group.engine_group_idx, buf0.dtype)
-            if rot is None:
-                # Skipped group (declared [] or quantized): staging + scatter
-                # only. cos_sin_cache == 0 disables native rope, so the
-                # rope-only fields are never read and the dtype gate below
-                # must not run (a uint8 group would knock every group off
-                # the native plan).
+            if rot is None or not rope_state.cos_sin_caches:
+                # Skipped group — declared [], quantized, or a NoPE model (no
+                # cos/sin cache at all): staging + scatter only.
+                # cos_sin_cache == 0 disables native rope, so the rope-only
+                # fields are never read and the dtype gate below must not run
+                # (a uint8 group would knock every group off the native plan).
                 group_specs.append(
                     lmc_ops.CBGroupSpec(
                         cos_sin_cache=0,
@@ -1941,7 +2130,10 @@ class BlendV3Module(InstanceLivenessTarget):
                 )
             except RuntimeError:
                 return None
+            # Non-None here: the NoPE (zero-cache) case took the skipped-group
+            # branch above for every group.
             group_cos_sin = rope_state.cache_for_group(group.engine_group_idx)
+            assert group_cos_sin is not None
             if rot_offset > 0 and int(group_cos_sin.shape[1]) != rot[1]:
                 return None
 
@@ -2111,6 +2303,14 @@ class BlendV3Module(InstanceLivenessTarget):
 
         groups_arr = np.arange(num_groups, dtype=np.int64)
         shifted = old_st != cur_st
+        if not rope_state.cos_sin_caches:
+            # NoPE model: a shifted match needs no re-RoPE, and emitting the
+            # rope rows anyway costs twice — pybind unpacks the tables into C++
+            # structs while the GIL is still HELD (release happens after the
+            # unpack), then the executor walks ramp-rope entries that cannot
+            # change a value. Marking nothing shifted drops both and leaves the
+            # staging/scatter tables untouched.
+            shifted = np.zeros_like(shifted)
         n_shifted = int(shifted.sum())
         ropes = np.stack(
             [
@@ -2555,7 +2755,10 @@ class BlendV3Module(InstanceLivenessTarget):
             applied_entry = applied_ranges.setdefault(applied_key, set())
             applied_entry.update(applied_now)
             applied_ranges.move_to_end(applied_key)
-            while len(applied_ranges) > 4096:
+            # One entry per (request, worker), so scale the cap by world size to
+            # keep the same number of *requests* covered as at TP1.
+            cap = 4096 * max(1, int(key.world_size or 1))
+            while len(applied_ranges) > cap:
                 applied_ranges.popitem(last=False)
 
         _scatter_ms = (time.perf_counter() - _retrieve_t0) * 1000
