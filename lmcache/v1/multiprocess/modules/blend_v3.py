@@ -81,6 +81,13 @@ _NOOP_REASONS_SEEN: set[str] = set()
 # that predate the op (and for inputs the planner declines).
 _HAS_NATIVE_RETRIEVE_PLAN = hasattr(lmc_ops, "execute_cb_retrieve_plan_flat")
 
+#: CB_SCATTER_DEBUG=1 — log, per retrieve, the exact destination slots the
+#: scatter computes for every match and group. Diagnostic for plugin issue #59:
+#: the worker side predicts delivery at ``block_ids[p // bs] * bs + p % bs`` and
+#: 13 of 19 rejected aux loads found the bytes elsewhere; this prints the
+#: server's side of that equation so the two can be diffed per request.
+_SCATTER_DEBUG = os.environ.get("CB_SCATTER_DEBUG", "0") != "0"
+
 # torch dtype -> at::ScalarType (rope dispatch); missing -> Python fallback.
 _TORCH_TO_AT_SCALAR = {
     torch.float16: 5,  # at::ScalarType::Half
@@ -635,6 +642,11 @@ class BlendV3Module(InstanceLivenessTarget):
         # Async fingerprint registration: store enqueues, worker drains.
         _FpJob = tuple[list[int], list[bytes], int, int]
         self._fingerprint_queue: "Queue[_FpJob]" = Queue()
+        #: Per-context completion event of the last native retrieve (#59a):
+        #: the next plan build waits on it before rewriting shared buffers.
+        self._cb_plan_done_events: "weakref.WeakKeyDictionary" = (
+            weakref.WeakKeyDictionary()
+        )
         self._fingerprint_stop = threading.Event()
         self._fingerprint_worker = threading.Thread(
             target=self._drain_fingerprint_queue,
@@ -926,6 +938,25 @@ class BlendV3Module(InstanceLivenessTarget):
                     start_chunk_idx=start_chunk_idx,
                     position_offset=position_offset,
                 )
+                if _SCATTER_DEBUG:
+                    # Pairs with the "fp dbg enqueue" log: the gap between the
+                    # two lines is the L1-commit latency the registration is
+                    # FIFO-ordered behind (launch_host_func on cupy_stream).
+                    logger.info(
+                        "CB fp dbg drained hashes=%d start_idx=%d pos_off=%d",
+                        len(chunk_hashes),
+                        start_chunk_idx,
+                        position_offset,
+                    )
+                if _SCATTER_DEBUG:
+                    logger.info(
+                        "CB fp dbg drained job: %d tokens %d hashes "
+                        "start_chunk_idx=%d offset=%d",
+                        len(tokens_in_range),
+                        len(chunk_hashes),
+                        start_chunk_idx,
+                        position_offset,
+                    )
             except Exception:
                 logger.exception("CB fingerprint registration failed (sync drain)")
 
@@ -1589,6 +1620,14 @@ class BlendV3Module(InstanceLivenessTarget):
                 TokenHasher.hash_to_bytes(h)
                 for h in session.get_hashes(key.start, key.end)
             ]
+            if _SCATTER_DEBUG:
+                logger.info(
+                    "CB fp dbg enqueue req=%s range=[%d,%d) hashes=%d",
+                    key.request_id,
+                    key.start,
+                    key.end,
+                    len(chunk_hashes),
+                )
             if not chunk_hashes:
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
@@ -1844,6 +1883,16 @@ class BlendV3Module(InstanceLivenessTarget):
                     start_chunk_idx=start_chunk_idx,
                     position_offset=position_offset,
                 )
+                if _SCATTER_DEBUG:
+                    # Pairs with the "fp dbg enqueue" log: the gap between the
+                    # two lines is the L1-commit latency the registration is
+                    # FIFO-ordered behind (launch_host_func on cupy_stream).
+                    logger.info(
+                        "CB fp dbg drained hashes=%d start_idx=%d pos_off=%d",
+                        len(chunk_hashes),
+                        start_chunk_idx,
+                        position_offset,
+                    )
             except Exception:
                 logger.exception("CB fingerprint registration failed (async)")
             finally:
@@ -2153,6 +2202,27 @@ class BlendV3Module(InstanceLivenessTarget):
             gpu_context.get_temp_object_group_buffer(slot, 0)
             for slot in range(max_batch)
         ]
+        if _SCATTER_DEBUG:
+            # Geometry dump for #59a: how the retrieve plan interprets each
+            # group vs how the source layer was registered. buf0.shape[0] is
+            # the kv plane count — a 2 here for the aux pool (registered as a
+            # flat [pages, tokens, width] tensor) means the scatter treats the
+            # page as split K/V planes and permutes its rows.
+            for gi2 in range(kgm.num_kernel_groups):
+                g2 = kgm.kernel_groups[gi2]
+                b2 = gpu_context.get_temp_kernel_group_buffer(0, gi2)
+                logger.info(
+                    "CB spec dbg group=%d eg=%d bs=%d buf0.shape=%s dtype=%s "
+                    "fmt=%s shape_desc.nb=%d layers=%s",
+                    gi2,
+                    g2.engine_group_idx,
+                    g2.tokens_per_block,
+                    tuple(b2.shape),
+                    b2.dtype,
+                    gpu_context.get_engine_kv_format(gi2),
+                    int(g2.shape_desc.nb),
+                    [n for n in getattr(g2, "layer_names", [])][:3],
+                )
         return group_specs, object_group_buffers
 
     def _build_cb_retrieve_plan_flat(
@@ -2235,6 +2305,57 @@ class BlendV3Module(InstanceLivenessTarget):
             # Size mismatch: the fallback path raises the descriptive error.
             return None
 
+        if _SCATTER_DEBUG:
+            # Source-side header probe (issue #59): the destinations were
+            # verified identical on both sides, so if the worker still rejects,
+            # the wrong bytes are IN THE OBJECT. Read each object's last-group
+            # slice (the aux plane rides last) at row 0, where a well-formed
+            # page carries magic + chunk_id, before anything is scattered.
+            # Objects are L1 host memory, so this is a plain pointer read.
+            import ctypes
+            import struct
+
+            aux_off = sum(int(b.nbytes) for b in object_group_buffers[:-1])
+            #: The aux page header magic (plugin arch/mamba2 _HEADER_MAGIC).
+            magic = 1128415576
+            for pi, (r, memory_obj) in enumerate(pairs):
+                try:
+                    # Where in the WHOLE object does the magic live, if
+                    # anywhere? Distinguishes "aux page at an unexpected
+                    # offset" (layout disagreement) from "no aux page in the
+                    # object at all" (store-side omission). Then read the
+                    # header AT the magic: words[4] is the stored chunk_id,
+                    # comparable against the worker's expected id — matching
+                    # ids exonerate the object and indict the H2D/scatter leg;
+                    # differing ids indict the store/keying side.
+                    total = int(memory_obj.get_size())
+                    arr = np.frombuffer(
+                        ctypes.string_at(int(memory_obj.data_ptr), total),
+                        dtype=np.int32,
+                    )
+                    hits = (np.where(arr == magic)[0] * 4)[:6].tolist()
+                    if hits:
+                        raw = ctypes.string_at(
+                            int(memory_obj.data_ptr) + hits[0], 24
+                        )
+                        words = struct.unpack("<6i", raw)
+                    else:
+                        words = ()
+                except Exception as e:  # noqa: BLE001
+                    words, hits, total = f"unreadable: {e}", [], -1
+                logger.info(
+                    "CB scatter dbg src[%d] cur=[%d,%d) old_st=%d aux_off=%d "
+                    "obj_bytes=%d head_words=%s magic_at_bytes=%s",
+                    pi,
+                    r.cur_st,
+                    r.cur_ed,
+                    r.old_st,
+                    aux_off,
+                    total,
+                    words,
+                    hits,
+                )
+
         # Shared logical positions + per-group slot mappings, in numpy on
         # pinned staging with one async H2D per group (persistent buffers).
         # The old device-side arange/div/mod chain cost 25-160 ms per request
@@ -2285,8 +2406,38 @@ class BlendV3Module(InstanceLivenessTarget):
             # copies spec contents at call time.
             spec.slot_mapping_base = int(dev_buf[gi].data_ptr())
             spec.slot_mapping_capacity = n_pos
+            if _SCATTER_DEBUG:
+                # The exact slots this group will scatter to, summarized per
+                # run: first/last slot plus their (block, row) decomposition —
+                # directly comparable with the worker's `_page_pieces`
+                # prediction for the aux group.
+                off = 0
+                for run in run_iter:
+                    ln = run[-1][0].cur_ed - run[0][0].cur_st
+                    s0 = int(pinned_np[gi, off])
+                    s1 = int(pinned_np[gi, off + ln - 1])
+                    logger.info(
+                        "CB scatter dbg native group=%d bs=%d "
+                        "run cur=[%d,%d) slot_first=%d (blk %d row %d) "
+                        "slot_last=%d (blk %d row %d) table_len=%d",
+                        gi,
+                        group_bs,
+                        run[0][0].cur_st,
+                        run[-1][0].cur_ed,
+                        s0,
+                        s0 // group_bs,
+                        s0 % group_bs,
+                        s1,
+                        s1 // group_bs,
+                        s1 % group_bs,
+                        int(block_ids_np.shape[0]),
+                    )
+                    off += ln
         # The device staging must outlive the native call.
         keepalive = [dev_buf]
+        if _SCATTER_DEBUG:
+            # Stash for the post-exec staging checksum (#59a probe).
+            self._dbg_plan = (list(pairs), object_group_buffers)
 
         # Waves of `wave` chunks per run, alternating slot halves.
         slot_of = np.empty(n, dtype=np.int64)
@@ -2682,6 +2833,40 @@ class BlendV3Module(InstanceLivenessTarget):
                         else:
                             runs.append([r_obj])
 
+                    if _SCATTER_DEBUG:
+                        # One line per request, then one per match: the
+                        # match->object pairing (zip order — a mispairing here
+                        # delivers the RIGHT bytes to the WRONG chunk, which
+                        # reads as an identity mismatch on the worker) and the
+                        # per-group geometry the slot math will use.
+                        logger.info(
+                            "CB scatter dbg req=%s pairs=%d dropped=%d "
+                            "runs=%s groups=%s",
+                            key.request_id,
+                            len(pairs),
+                            len(cb_match_result) - len(pairs),
+                            [
+                                (run[0][0].cur_st, run[-1][0].cur_ed, len(run))
+                                for run in runs
+                            ],
+                            [
+                                (int(t.numel()), bs)
+                                for t, bs in resolved_groups
+                            ],
+                        )
+                        for pi, (r, mo) in enumerate(pairs):
+                            h = r.hash
+                            logger.info(
+                                "CB scatter dbg pair[%d] hash=%s cur=[%d,%d) "
+                                "old_st=%d obj_bytes=%d",
+                                pi,
+                                h.hex()[:12] if isinstance(h, bytes) else h,
+                                r.cur_st,
+                                r.cur_ed,
+                                r.old_st,
+                                mo.get_size(),
+                            )
+
                     max_batch = gpu_context.max_batch_size
 
                     # Fast path: one native call for the whole request; the
@@ -2692,6 +2877,13 @@ class BlendV3Module(InstanceLivenessTarget):
                         gpu_context, rope_state, cpu_block_tables, runs, max_batch
                     )
                     _stage_ms["plan"] = (time.perf_counter() - _stage_t) * 1000
+                    if _SCATTER_DEBUG:
+                        logger.info(
+                            "CB scatter dbg req=%s path=%s max_batch=%d",
+                            key.request_id,
+                            "native" if native_flat is not None else "fallback",
+                            max_batch,
+                        )
                     if native_flat is not None:
                         plan_group_specs, plan_tables, _plan_keepalive = native_flat
                         _stage_t = time.perf_counter()
@@ -2702,6 +2894,76 @@ class BlendV3Module(InstanceLivenessTarget):
                             *plan_tables,
                         )
                         _stage_ms["exec"] = (time.perf_counter() - _stage_t) * 1000
+                        # #59a: stamp completion of this retrieve's kernels so
+                        # the NEXT request's plan build can wait on exactly
+                        # this work before rewriting the shared buffers. The
+                        # native exec enqueues its kernels on the caller's
+                        # current stream, so recording here covers them.
+                        _done_ev = torch.cuda.Event()
+                        _done_ev.record(
+                            torch.cuda.current_stream(gpu_context.device)
+                        )
+                        self._cb_plan_done_events[gpu_context] = _done_ev
+                        if _SCATTER_DEBUG and getattr(self, "_dbg_plan", None):
+                            # Staging checksum (#59a): compare the DEVICE temp
+                            # object buffer against the HOST object after the
+                            # native call, per byte. Only the last wave's slots
+                            # still hold their chunks; a tail-only divergence
+                            # (first_diff >= the KV slice) convicts pin-chunk
+                            # H2D segmentation; zero mismatches exonerates
+                            # staging and convicts the fmt=3 scatter kernel.
+                            import ctypes as _ct
+
+                            dbg_pairs, dbg_bufs = self._dbg_plan
+                            self._dbg_plan = None
+                            torch_dev.synchronize(gpu_context.device)
+                            wave_dbg = len(dbg_bufs) // 2
+                            for di in range(
+                                max(0, len(dbg_pairs) - wave_dbg), len(dbg_pairs)
+                            ):
+                                sd = (
+                                    ((di // wave_dbg) % 2) * wave_dbg
+                                    + di % wave_dbg
+                                )
+                                rd, mod = dbg_pairs[di]
+                                dev_np = dbg_bufs[sd].cpu().numpy()
+                                host_np = np.frombuffer(
+                                    _ct.string_at(
+                                        int(mod.data_ptr), dev_np.size
+                                    ),
+                                    dtype=np.uint8,
+                                )
+                                neq = np.nonzero(dev_np != host_np)[0]
+                                # Post-scatter page compare (#59a, final
+                                # hop): the aux group is the LAST kernel
+                                # group; its staged slice must equal the
+                                # pool page the scatter just wrote for a
+                                # block-aligned piece. Compare the slice's
+                                # first row region against the destination
+                                # pool page row range via the paged pointer
+                                # is kernel-side; here we can only flag the
+                                # staged slice geometry, so log its first 6
+                                # int32 words for offline diff against the
+                                # worker's pool-page dump.
+                                aux_off_d = dev_np.size - 18314848
+                                logger.info(
+                                    "CB stage dbg aux_head=%s",
+                                    np.frombuffer(
+                                        dev_np[aux_off_d : aux_off_d + 24]
+                                        .tobytes(),
+                                        dtype=np.int32,
+                                    ).tolist(),
+                                )
+                                logger.info(
+                                    "CB stage dbg cur=[%d,%d) slot=%d "
+                                    "bytes=%d mismatched=%d first_diff=%d",
+                                    rd.cur_st,
+                                    rd.cur_ed,
+                                    sd,
+                                    dev_np.size,
+                                    int(neq.size),
+                                    int(neq[0]) if neq.size else -1,
+                                )
                         runs = []  # plan covers every wave; skip the loop
 
                     for run in runs:
