@@ -16,6 +16,7 @@ import os
 import threading
 import time
 import weakref
+import zlib
 
 if TYPE_CHECKING:
     # First Party
@@ -2256,6 +2257,17 @@ class BlendV3Module(InstanceLivenessTarget):
         pinned, pinned_np, dev_buf = self._cb_slot_buffers(
             gpu_context, num_groups, n_pos
         )
+        # #59a: the buffers above are per-context singletons and the PREVIOUS
+        # request's retrieve kernels may still be reading dev_buf (and its H2D
+        # of `pinned` may still be in flight) when this request's plan
+        # rebuilds them — the cross-request race that scattered chunk A's page
+        # into chunk B's slots. The device-wide sync is PROVEN (0 rejections,
+        # gate B exact output); the scoped-event variant leaked (3-8
+        # rejections per fresh seed) because the event was recorded on a
+        # stream that is not provably the one the native call's kernels run
+        # on — identify that stream before reattempting.
+        if gpu_context.device.type == "cuda":
+            torch.cuda.synchronize(gpu_context.device)
         div_mod: "dict[int, tuple[np.ndarray, np.ndarray]]" = {}
         for gi, ((block_ids_np, group_bs), spec) in enumerate(
             zip(cpu_block_tables, group_specs, strict=True)
@@ -2440,8 +2452,23 @@ class BlendV3Module(InstanceLivenessTarget):
 
         cb_match_result = sorted(cb_match_result, key=lambda r: r.cur_st)
         # vLLM may call retrieve twice (partial- then full-block alloc); skip
-        # ranges already scattered (blocks never move mid-prefill), returning
-        # before the obj-key/prefetched-read machinery (~7-20 ms).
+        # ranges already scattered, returning before the obj-key/
+        # prefetched-read machinery (~7-20 ms). "Blocks never move
+        # mid-prefill" holds for vLLM KV blocks but NOT for the
+        # connector-injected aux receive pages: the worker can assign a
+        # DIFFERENT aux pool page on the repeat call, and a destination-blind
+        # skip then leaves the new page empty — the worker validates it,
+        # rejects, and the request silently full-recomputes (observed:
+        # f1_tp1_r64_evfix 19:34:31, scatter OK then "no-op success" then
+        # empty-page rejection). Qualify the applied set with a fingerprint
+        # of the FULL destination table so a repeat with changed block ids
+        # re-scatters everything (idempotent for unmoved KV blocks,
+        # corrective for reassigned aux pages).
+        dest_fp = zlib.crc32(
+            np.asarray(
+                [b for grp in gpu_block_ids for b in grp], dtype=np.int64
+            ).tobytes()
+        )
         applied_ranges = self._cb_applied_match_ranges
         applied_key = (key.request_id, key.worker_id)
         prior_applied = applied_ranges.get(applied_key)
@@ -2449,11 +2476,11 @@ class BlendV3Module(InstanceLivenessTarget):
             cb_match_result = [
                 r
                 for r in cb_match_result
-                if (r.hash, r.cur_st, r.cur_ed) not in prior_applied
+                if (r.hash, r.cur_st, r.cur_ed, dest_fp) not in prior_applied
             ]
             if not cb_match_result:
                 return _noop_success("all ranges already applied for this worker")
-        applied_now: "set[tuple[bytes, int, int]]" = set()
+        applied_now: "set[tuple[bytes, int, int, int]]" = set()
         # Partial-alloc first call: every match can be beyond the allocated
         # slots -> return before the obj-key machinery. Read locks stay held
         # for the full-alloc follow-up, as the in-loop drop path leaves them.
@@ -2709,7 +2736,9 @@ class BlendV3Module(InstanceLivenessTarget):
                                 rope_state.head_size,
                             )
 
-                    applied_now = {(r.hash, r.cur_st, r.cur_ed) for r, _ in pairs}
+                    applied_now = {
+                        (r.hash, r.cur_st, r.cur_ed, dest_fp) for r, _ in pairs
+                    }
 
                     self._event_bus.publish_on_stream(
                         gpu_context.cupy_stream,
