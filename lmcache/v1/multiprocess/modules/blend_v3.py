@@ -87,6 +87,10 @@ _HAS_NATIVE_RETRIEVE_PLAN = hasattr(lmc_ops, "execute_cb_retrieve_plan_flat")
 #: 13 of 19 rejected aux loads found the bytes elsewhere; this prints the
 #: server's side of that equation so the two can be diffed per request.
 _SCATTER_DEBUG = os.environ.get("CB_SCATTER_DEBUG", "0") != "0"
+#: Refuse to index chunk windows fully covered by already-registered content
+#: at any alignment (see on_new_token_hashes). Default on; =0 restores
+#: exact-duplicate-only dedup.
+_FP_SKIP_COVERED = os.environ.get("CB_FP_SKIP_COVERED", "1") != "0"
 
 # torch dtype -> at::ScalarType (rope dispatch); missing -> Python fallback.
 _TORCH_TO_AT_SCALAR = {
@@ -308,11 +312,56 @@ class BlendTokenRangeMatcherV3:
             return
 
         with self._lock:
+            # Coverage filter (mirror of the worker's store-side encode skip,
+            # arch/mamba2 _reused_store_chunks): a chunk window fully covered
+            # by ALREADY-REGISTERED content at any alignment adds no new
+            # retrievable coverage — any future query containing this window
+            # contains the covering originals too, and matches them directly.
+            # Indexing it anyway is actively harmful for recurrent-hybrid
+            # stores: the worker skipped its aux encode as covered, so the
+            # registered copy would carry a POISONED aux page — matches
+            # landing on it reject at delivery and shadow the aux-carrying
+            # originals (observed: perf_cb_reuse, 28 rejections, blends
+            # 8/46). Exact-content duplicates are handled separately by
+            # _content_is_live below; this extends the refusal to shifted
+            # windows. CB_FP_SKIP_COVERED=0 restores the old behavior.
+            covered: list[tuple[int, int]] = []
+            if (
+                _FP_SKIP_COVERED
+                and self._chunk_token_hash
+                and len(arr) >= self.chunk_size
+            ):
+                rolling = rolling_hash_windows_numba(
+                    arr, self.chunk_size, self._BASE
+                )
+                cids_at_pos = self._table_id[rolling & self._mask]
+                spans: list[tuple[int, int]] = []
+                for pos in np.nonzero(cids_at_pos >= 0)[0]:
+                    pos = int(pos)
+                    cid = int(cids_at_pos[pos])
+                    if int(rolling[pos]) != self._chunk_poly_hash[cid]:
+                        continue  # bucket-only collision
+                    if self._chunk_token_hash[cid] is None:
+                        continue  # evicted
+                    spans.append((pos, pos + self.chunk_size))
+                spans.sort()
+                for lo, hi in spans:
+                    if covered and lo <= covered[-1][1]:
+                        covered[-1] = (covered[-1][0], max(covered[-1][1], hi))
+                    else:
+                        covered.append((lo, hi))
+
+            def _is_covered(i: int) -> bool:
+                c_lo = i * self.chunk_size
+                c_hi = c_lo + self.chunk_size
+                return any(lo <= c_lo and c_hi <= hi for lo, hi in covered)
+
             new_idxs = [
                 i
                 for i in range(start_chunk_idx, n)
                 if token_hashes[i] not in self._token_hash_to_compact_id
                 and not self._content_is_live(int(chunk_hashes[i]))
+                and not _is_covered(i)
             ]
             if not new_idxs:
                 return
@@ -2382,11 +2431,25 @@ class BlendV3Module(InstanceLivenessTarget):
         # request's retrieve kernels may still be reading dev_buf (and its H2D
         # of `pinned` may still be in flight) when this request's plan
         # rebuilds them — the cross-request race that scattered chunk A's page
-        # into chunk B's slots. The device-wide sync is PROVEN (0 rejections,
-        # gate B exact output); the scoped-event variant leaked (3-8
-        # rejections per fresh seed) because the event was recorded on a
-        # stream that is not provably the one the native call's kernels run
-        # on — identify that stream before reattempting.
+        # into chunk B's slots. The race is against a HOST write (pinned_np),
+        # which no stream-side wait can protect — the earlier scoped-event
+        # attempt leaked (3-8 rejections per fresh seed) for the same
+        # wait-vs-synchronize confusion #64a had. Host-SYNCHRONIZE on the
+        # per-context event recorded on the exec stream right after
+        # execute_cb_retrieve_plan_flat: every prior copy and kernel rode
+        # that stream, so it covers exactly the prior retrieve's work.
+        # SCOPED EVENT IS UNSOUND with the current native call (verified
+        # twice: 3-8 rejections originally; 18 rejections + blends 1/24 in
+        # perf_cb_final with host-synchronize on a post-exec current-stream
+        # event): execute_cb_retrieve_plan_flat stages H2D on its own
+        # internal POOL STREAMS, which no caller-stream event covers. The
+        # enabling fix is in csrc — the native call must join its internal
+        # streams into the caller's stream at exit (record event per pool
+        # stream + cudaStreamWaitEvent); only then can this become
+        # _cb_plan_done_events.pop(ctx).synchronize(). Until then the
+        # device-wide sync is the only correct barrier, and its cost is the
+        # documented one: plan-build serializes behind the server's
+        # L1-commit copies (450-1145 ms in commit-heavy steady state).
         if gpu_context.device.type == "cuda":
             torch.cuda.synchronize(gpu_context.device)
         div_mod: "dict[int, tuple[np.ndarray, np.ndarray]]" = {}
